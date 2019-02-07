@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/derailed/k9s/resource/k8s"
 	"github.com/gdamore/tcell"
 	"github.com/k8sland/tview"
 	log "github.com/sirupsen/logrus"
@@ -31,9 +32,7 @@ type (
 	appView struct {
 		*tview.Application
 
-		refreshRate  int
 		version      string
-		defaultNS    string
 		pages        *tview.Pages
 		content      *tview.Pages
 		flashView    *flashView
@@ -44,22 +43,22 @@ type (
 		focusCurrent int
 		focusChanged focusHandler
 		cancel       context.CancelFunc
-		cmdBuff      []rune
+		cmdBuff      *cmdBuff
+		cmdView      *cmdView
 	}
 )
 
 // NewApp returns a K9s app instance.
-func NewApp(v string, rate int, ns string) *appView {
+func NewApp() *appView {
 	var app appView
 	{
 		app = appView{
 			Application: tview.NewApplication(),
 			pages:       tview.NewPages(),
-			version:     v,
 			menuView:    newMenuView(),
 			content:     tview.NewPages(),
-			refreshRate: rate,
-			defaultNS:   ns,
+			cmdBuff:     newCmdBuff('>'),
+			cmdView:     newCmdView('🐶'),
 		}
 		app.command = newCommand(&app)
 		app.focusChanged = app.changedFocus
@@ -68,16 +67,24 @@ func NewApp(v string, rate int, ns string) *appView {
 	return &app
 }
 
-func (a *appView) Init() {
+func (a *appView) Init(v string, rate int, ns string) {
+	a.version = v
+
+	log.Info("🐶 K9s starting up...")
+	mustK8s()
+	initConfig(rate, ns)
+
 	a.infoView = newInfoView(a)
 	a.infoView.init()
 
 	a.flashView = newFlashView(a.Application, "Initializing...")
 
+	a.cmdBuff.addListener(a.cmdView)
+
 	header := tview.NewFlex()
 	{
 		header.SetDirection(tview.FlexColumn)
-		header.AddItem(a.infoView, 25, 1, false)
+		header.AddItem(a.infoView, 30, 1, false)
 		header.AddItem(a.menuView, 0, 1, false)
 		header.AddItem(logoView(), 26, 1, false)
 	}
@@ -85,14 +92,33 @@ func (a *appView) Init() {
 	main := tview.NewFlex()
 	{
 		main.SetDirection(tview.FlexRow)
-		main.AddItem(header, 7, 1, false)
+		main.AddItem(header, 6, 1, false)
+		main.AddItem(a.cmdView, 1, 1, false)
 		main.AddItem(a.content, 0, 10, true)
-		main.AddItem(a.flashView, 1, 1, false)
+		main.AddItem(a.flashView, 2, 1, false)
 	}
 
 	a.pages.AddPage("main", main, true, false)
 	a.pages.AddPage("splash", NewSplash(a.version), true, true)
 	a.SetRoot(a.pages, true)
+}
+
+func initConfig(rate int, ns string) {
+	k9sCfg.load(K9sConfig)
+	k9sCfg.K9s.RefreshRate = rate
+	if len(ns) != 0 {
+		k9sCfg.K9s.Namespace.Active = ns
+	}
+	k9sCfg.validate()
+	k9sCfg.save(K9sConfig)
+}
+
+func mustK8s() {
+	k8s.ConfigOrDie()
+	if _, err := k8s.NewNamespace().List(defaultNS); err != nil {
+		panic(err)
+	}
+	log.Info("Kubernetes connectivity ✅")
 }
 
 // Run starts the application loop
@@ -105,37 +131,48 @@ func (a *appView) Run() {
 
 	a.command.defaultCmd()
 	if err := a.Application.Run(); err != nil {
-		log.Panic(err)
+		panic(err)
 	}
 }
 
 func (a *appView) keyboard(evt *tcell.EventKey) *tcell.EventKey {
-	switch evt.Rune() {
-	case 'q':
-		a.quit(evt)
-		return nil
+	key := evt.Key()
+	if key == tcell.KeyRune {
+		switch evt.Rune() {
+		case a.cmdBuff.hotKey:
+			a.cmdBuff.setActive(true)
+			a.cmdBuff.clear()
+			return evt
+		}
+
+		if a.cmdBuff.isActive() {
+			a.cmdBuff.add(evt.Rune())
+		}
+		return evt
 	}
 
 	switch evt.Key() {
+	case tcell.KeyCtrlQ:
+		a.quit(evt)
+	case tcell.KeyCtrlH:
+		a.help(evt)
 	case tcell.KeyCtrlR:
 		a.Draw()
 	case tcell.KeyEsc:
-		a.resetCmd()
+		a.cmdBuff.reset()
 	case tcell.KeyEnter:
-		if len(a.cmdBuff) != 0 {
-			a.command.run(string(a.cmdBuff))
+		if a.cmdBuff.isActive() && !a.cmdBuff.empty() {
+			a.command.run(a.cmdBuff.String())
 		}
-		a.resetCmd()
+		a.cmdBuff.setActive(false)
+	case tcell.KeyBackspace2:
+		if a.cmdBuff.isActive() {
+			a.cmdBuff.del()
+		}
 	case tcell.KeyTab:
 		a.nextFocus()
-	case tcell.KeyRune:
-		a.cmdBuff = append([]rune(a.cmdBuff), evt.Rune())
 	}
 	return evt
-}
-
-func (a *appView) resetCmd() {
-	a.cmdBuff = []rune{}
 }
 
 func (a *appView) showPage(p string) {
@@ -149,10 +186,10 @@ func (a *appView) inject(p igniter) {
 	a.content.RemovePage("main")
 	a.content.AddPage("main", p, true, true)
 
+	var ctx context.Context
 	{
-		var ctx context.Context
 		ctx, a.cancel = context.WithCancel(context.TODO())
-		p.init(ctx, a.defaultNS)
+		p.init(ctx, k9sCfg.K9s.Namespace.Active)
 	}
 
 	go func() {
@@ -168,6 +205,10 @@ func (a *appView) inject(p igniter) {
 
 func (a *appView) refresh() {
 	a.infoView.refresh()
+}
+
+func (a *appView) help(*tcell.EventKey) {
+	a.inject(newHelpView(a))
 }
 
 func (a *appView) quit(*tcell.EventKey) {

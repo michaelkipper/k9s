@@ -29,14 +29,13 @@ func newHelpView(app *appView) *helpView {
 // Init the view.
 func (v *helpView) init(context.Context, string) {
 	v.keys = keyActions{
-		tcell.KeyCtrlB: keyAction{description: "Help Back", action: v.back},
+		tcell.KeyEscape: keyAction{description: "Back", action: v.back},
 	}
 
-	var t *tview.Table
+	t := tview.NewTable()
 	{
-		t = tview.NewTable()
 		t.SetBorder(true)
-		t.SetTitle(" [::b]Commands Help ")
+		t.SetTitle(" [::b]Commands Aliases ")
 		t.SetTitleColor(tcell.ColorAqua)
 		t.SetBorderColor(tcell.ColorDodgerBlue)
 		t.SetSelectable(true, false)
@@ -82,7 +81,7 @@ func (v *helpView) init(context.Context, string) {
 
 func (v *helpView) keyboard(evt *tcell.EventKey) *tcell.EventKey {
 	switch evt.Key() {
-	case tcell.KeyCtrlB:
+	case tcell.KeyEscape:
 		v.back(evt)
 		return nil
 	case tcell.KeyEnter:

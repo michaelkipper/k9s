@@ -2,6 +2,9 @@ package views
 
 import (
 	"fmt"
+	"regexp"
+	"strings"
+	"sync"
 
 	"github.com/derailed/k9s/resource"
 	"github.com/gdamore/tcell"
@@ -15,52 +18,116 @@ const (
 
 type (
 	tableView struct {
-		*tview.Table
+		*tview.Flex
+
+		app       *appView
 		baseTitle string
 		currentNS string
+		refresh   sync.Mutex
 		actions   keyActions
 		colorer   colorerFn
-		cmdBuff   string
 		sortFn    resource.SortFn
-		parent    *resourceView
+		table     *tview.Table
+		data      resource.TableData
+		cmdBuff   *cmdBuff
 	}
 )
 
-func newTableView(title string, sortFn resource.SortFn) *tableView {
-	v := tableView{Table: tview.NewTable(), baseTitle: title, sortFn: sortFn}
-	v.SetBorder(true)
-	v.SetBorderColor(tcell.ColorDodgerBlue)
-	v.SetBorderAttributes(tcell.AttrBold)
-	v.SetBorderPadding(0, 0, 1, 1)
-	v.SetSelectable(true, false)
-	v.SetSelectedStyle(tcell.ColorBlack, tcell.ColorAqua, tcell.AttrBold)
-	v.SetInputCapture(v.keyboard)
+func newTableView(app *appView, title string, sortFn resource.SortFn) *tableView {
+	v := tableView{app: app, Flex: tview.NewFlex().SetDirection(tview.FlexRow)}
+	{
+		v.baseTitle = title
+		v.sortFn = sortFn
+		v.SetBorder(true)
+		v.SetBorderColor(tcell.ColorDodgerBlue)
+		v.SetBorderAttributes(tcell.AttrBold)
+		v.SetBorderPadding(0, 0, 1, 1)
+		v.cmdBuff = newCmdBuff('/')
+	}
+
+	v.cmdBuff.addListener(app.cmdView)
+	v.cmdBuff.reset()
+
+	v.table = tview.NewTable()
+	{
+		v.table.SetSelectable(true, false)
+		v.table.SetSelectedStyle(tcell.ColorBlack, tcell.ColorAqua, tcell.AttrBold)
+		v.table.SetInputCapture(v.keyboard)
+	}
+
+	v.AddItem(v.table, 0, 1, true)
 	return &v
 }
 
 func (v *tableView) setDeleted() {
-	r, _ := v.GetSelection()
-	cols := v.GetColumnCount()
+	r, _ := v.table.GetSelection()
+	cols := v.table.GetColumnCount()
 	for x := 0; x < cols; x++ {
-		v.GetCell(r, x).SetAttributes(tcell.AttrDim)
+		v.table.GetCell(r, x).SetAttributes(tcell.AttrDim)
 	}
-	v.Select(0, 0)
 }
 
 func (v *tableView) keyboard(evt *tcell.EventKey) *tcell.EventKey {
+	key := evt.Key()
 	if evt.Key() == tcell.KeyRune {
-		if a, ok := v.actions[tcell.Key(evt.Rune())]; ok {
-			a.action(evt)
-			evt = nil
+		if v.cmdBuff.isActive() {
+			v.cmdBuff.add(evt.Rune())
 		}
-		return evt
+
+		switch evt.Rune() {
+		case v.cmdBuff.hotKey:
+			if !v.cmdBuff.isActive() {
+				v.cmdBuff.setActive(true)
+			}
+			return evt
+		}
+		key = tcell.Key(evt.Rune())
 	}
 
-	if a, ok := v.actions[evt.Key()]; ok {
+	if a, ok := v.actions[key]; ok {
 		a.action(evt)
-		evt = nil
+	}
+
+	switch evt.Key() {
+	case tcell.KeyEnter:
+		if v.cmdBuff.isActive() && !v.cmdBuff.empty() {
+			v.filter()
+		}
+		v.cmdBuff.setActive(false)
+	case tcell.KeyEsc:
+		v.cmdBuff.reset()
+		v.filter()
+	case tcell.KeyBackspace2:
+		if v.cmdBuff.isActive() {
+			v.cmdBuff.del()
+		}
 	}
 	return evt
+}
+
+func (v *tableView) filter() {
+	v.filterData(v.cmdBuff)
+}
+
+func (v *tableView) filterData(filter fmt.Stringer) {
+	filtered := resource.TableData{
+		Header:    v.data.Header,
+		Rows:      resource.RowEvents{},
+		Namespace: v.data.Namespace,
+	}
+
+	rx, err := regexp.Compile(filter.String())
+	if err != nil {
+		v.app.flash(flashErr, "Invalid search expression")
+		return
+	}
+	for k, row := range v.data.Rows {
+		f := strings.Join(row.Fields, " ")
+		if rx.MatchString(f) {
+			filtered.Rows[k] = row
+		}
+	}
+	v.doUpdate(filtered)
 }
 
 // SetColorer sets up table row color management.
@@ -89,21 +156,42 @@ func (v *tableView) hints() hints {
 }
 
 func (v *tableView) resetTitle() {
+	var title string
+
 	switch v.currentNS {
 	case resource.NotNamespaced:
-		v.SetTitle(fmt.Sprintf(titleFmt, v.baseTitle, v.GetRowCount()-1))
+		title = fmt.Sprintf(titleFmt, v.baseTitle, v.table.GetRowCount()-1)
 	default:
 		ns := v.currentNS
 		if v.currentNS == resource.AllNamespaces {
-			ns = "all"
+			ns = resource.AllNamespace
 		}
-		v.SetTitle(fmt.Sprintf(nsTitleFmt, v.baseTitle, ns, v.GetRowCount()-1))
+		title = fmt.Sprintf(nsTitleFmt, v.baseTitle, ns, v.table.GetRowCount()-1)
 	}
+
+	if !v.cmdBuff.empty() {
+		title += fmt.Sprintf("<[green::b]/%s[aqua::]> ", v.cmdBuff)
+	}
+	v.SetTitle(title)
 }
 
 // Update table content
 func (v *tableView) update(data resource.TableData) {
-	v.Clear()
+	v.refresh.Lock()
+	{
+		v.data = data
+		if !v.cmdBuff.empty() {
+			v.filter()
+		} else {
+			v.doUpdate(data)
+		}
+		v.resetTitle()
+	}
+	v.refresh.Unlock()
+}
+
+func (v *tableView) doUpdate(data resource.TableData) {
+	v.table.Clear()
 	v.currentNS = data.Namespace
 
 	var row int
@@ -116,7 +204,7 @@ func (v *tableView) update(data resource.TableData) {
 			}
 			c.SetTextColor(tcell.ColorWhite)
 		}
-		v.SetCell(row, col, c)
+		v.table.SetCell(row, col, c)
 	}
 	row++
 
@@ -139,9 +227,22 @@ func (v *tableView) update(data resource.TableData) {
 				}
 				c.SetTextColor(fgColor)
 			}
-			v.SetCell(row, col, c)
+			v.table.SetCell(row, col, c)
 		}
 		row++
 	}
-	v.resetTitle()
+}
+
+// ----------------------------------------------------------------------------
+// Event listeners...
+
+func (v *tableView) changed(s string) {
+}
+
+func (v *tableView) active(b bool) {
+	if b {
+		v.SetBorderColor(tcell.ColorRed)
+		return
+	}
+	v.SetBorderColor(tcell.ColorDodgerBlue)
 }
